@@ -1,9 +1,26 @@
 // q36 server: OpenAI-compatible HTTP API (chat completions with streaming, reasoning and tool calls) on top of the engine.
 //   q36-server <model.q36> [--tok file.tok] [--port 9936] [--ctx 32768] [--vram-gb 10.5] [--profile file] [--mtp 2] [--threads 6]
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#define Q36_SEND_FLAGS 0
+static inline int ctz32(unsigned v) { unsigned long b; _BitScanForward(&b, (unsigned long) v); return (int) b; }
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <csignal>
+typedef int SOCKET;
+#define INVALID_SOCKET (-1)
+#define SD_SEND SHUT_WR
+#define closesocket close
+#define Q36_SEND_FLAGS MSG_NOSIGNAL   // a client that hung up must not kill the server with SIGPIPE
+static inline int ctz32(unsigned v) { return __builtin_ctz(v); }
+#endif
 #include "../src/engine.hpp"
 #include "../src/tokenizer.hpp"
 #include "../src/chat.hpp"
@@ -21,7 +38,7 @@ struct Sampler {
         float mx[8]; _mm256_storeu_ps(mx, vm); float m = mx[0]; for (int k = 1; k < 8; k++) m = std::max(m, mx[k]); for (; i < n; i++) m = std::max(m, l[i]);
         if (sp.temp <= 0.0f) { // greedy: first index of the maximum
             const __m256 vq = _mm256_set1_ps(m);
-            for (i = 0; i + 8 <= n; i += 8) { const int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(l + i), vq, _CMP_EQ_OQ)); if (mask) { unsigned long b; _BitScanForward(&b, (unsigned long) mask); return i + (int) b; } }
+            for (i = 0; i + 8 <= n; i += 8) { const int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(l + i), vq, _CMP_EQ_OQ)); if (mask) return i + ctz32((unsigned) mask); }
             for (; i < n; i++) if (l[i] == m) return i;
             return 0;
         }
@@ -29,7 +46,7 @@ struct Sampler {
         float width = 16.0f;
         for (;;) {
             const __m256 vt = _mm256_set1_ps(m - width); cand.clear();
-            for (i = 0; i + 8 <= n; i += 8) { int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(l + i), vt, _CMP_GE_OQ)); while (mask) { unsigned long b; _BitScanForward(&b, (unsigned long) mask); mask &= mask - 1; cand.push_back({ l[i + b], i + (int) b }); } }
+            for (i = 0; i + 8 <= n; i += 8) { int mask = _mm256_movemask_ps(_mm256_cmp_ps(_mm256_loadu_ps(l + i), vt, _CMP_GE_OQ)); while (mask) { const int b = ctz32((unsigned) mask); mask &= mask - 1; cand.push_back({ l[i + b], i + b }); } }
             for (; i < n; i++) if (l[i] >= m - width) cand.push_back({ l[i], i });
             if (sp.top_k <= 0 || (int) cand.size() >= sp.top_k || width > 60.0f) break;
             width *= 2.0f;
@@ -210,7 +227,7 @@ struct Session {
 
 // ---------------------------------------------------------------- HTTP
 struct Req { std::string method, path, body; };
-static bool send_all(SOCKET s, const std::string & d) { size_t o = 0; while (o < d.size()) { int n = send(s, d.data() + o, (int) std::min<size_t>(d.size() - o, 1 << 20), 0); if (n <= 0) return false; o += n; } return true; }
+static bool send_all(SOCKET s, const std::string & d) { size_t o = 0; while (o < d.size()) { int n = send(s, d.data() + o, (int) std::min<size_t>(d.size() - o, 1 << 20), Q36_SEND_FLAGS); if (n <= 0) return false; o += n; } return true; }
 static bool read_req(SOCKET s, Req & r) {
     std::string buf; char tmp[65536]; size_t hdr_end = std::string::npos;
     while (hdr_end == std::string::npos) { int n = recv(s, tmp, sizeof tmp, 0); if (n <= 0) return false; buf.append(tmp, n); hdr_end = buf.find("\r\n\r\n"); if (buf.size() > (1 << 20) && hdr_end == std::string::npos) return false; }
@@ -272,9 +289,13 @@ int main(int argc, char ** argv) {
                e.vram / 1e9, e.cache->bytes / 1e9, e.cache->cls[0].cap + e.cache->cls[1].cap, 100.0 * (e.cache->cls[0].cap + e.cache->cls[1].cap) / (e.cache->nl * 256.0), ctx, have_prof ? "loaded" : "none", mtp, e.pf_window);
         Session ss(e, tk, mtp); ss.log_interval = log_level >= 1 ? log_interval : 0; ss.log_level = log_level; ss.pf_min = std::max(64, pf_min); ss.lookup = lookup;
 
+#ifdef _WIN32
         WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa);
+#else
+        signal(SIGPIPE, SIG_IGN);
+#endif
         SOCKET ls = socket(AF_INET, SOCK_STREAM, 0); int one = 1; setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char *) &one, sizeof one);
-        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons((u_short) port); inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
+        sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons((uint16_t) port); inet_pton(AF_INET, host.c_str(), &addr.sin_addr);
         if (bind(ls, (sockaddr *) &addr, sizeof addr) != 0 || listen(ls, 16) != 0) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
         printf("listening on http://%s:%d  (POST /v1/chat/completions)\n", host.c_str(), port);
         long req_id = 0; time_t last_save = time(nullptr);

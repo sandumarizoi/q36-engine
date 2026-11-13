@@ -5,7 +5,7 @@ It runs a single model on a single GPU and squeezes everything out of that combi
 rest of the MoE computed on the CPU, multi-token prediction (MTP) drafts, and a prompt-processing path that runs on the
 GPU's XMX matrix engines.
 
-It ships as an OpenAI-compatible HTTP server.
+It ships as an OpenAI-compatible HTTP server and builds on Windows and Linux.
 
 > q36 is not a general-purpose runtime. It supports exactly one model file (`Qwen3.6-35B-A3B-UD-Q4_K_M.gguf`) and one GPU
 > architecture (Xe2 / `bmg-g21`). Weight shapes and quantization types are baked into the kernels.
@@ -25,12 +25,12 @@ It ships as an OpenAI-compatible HTTP server.
 ## Performance
 
 Test system: Arc B580 12 GB (PCIe 3.0 x8), Ryzen 5 5500, 32 GB DDR4-3600, Windows 11. Server defaults
-(`--ctx 32768 --vram-gb 10.5 --mtp 2`), single request.
+(`--ctx 32768 --vram-gb 10.5 --mtp 2`), single request. Speeds on Linux (Fedora 44) are on par.
 
 | workload | tokens/s |
 |---|---|
 | code generation (greedy / sampled) | 128–133 / 128 |
-| Ukrainian prose | 126–136 |
+| Ukrainian prose | 126–141 |
 | follow-up turn with reasoning (Ukrainian) | 122 |
 | generation after a 16k-token prompt | 94 |
 | generation after a 30k-token prompt (`--ctx 65536`) | 83 |
@@ -42,25 +42,37 @@ tokens after a topic switch.
 
 ## Requirements
 
-- Windows 10/11 x64
-- Intel Arc B580 with a current driver
+- Intel Arc B580 (Xe2, `bmg-g21`)
 - 32 GB RAM (the model file is read fully into memory), ~23 GB of disk for the converted model
-- Visual Studio 2022 Build Tools (C++ workload)
 - Intel oneAPI DPC++/C++ Compiler 2025.x or newer (tested with 2026.2)
+- **Windows 10/11 x64:** current Arc driver, Visual Studio 2022 Build Tools (C++ workload)
+- **Linux x86-64:** a recent kernel with the `xe` driver and Intel compute-runtime (Level Zero) with Battlemage support,
+  g++ with C++17 (tested on Fedora 44)
 - The model: `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` from Unsloth's Qwen3.6-35B-A3B GGUF release (the file includes the MTP layer)
 
 ## Build
+
+Both scripts compile the server, a CLI and the two converters into `bin/`. Building the GPU programs takes a few
+minutes because the kernels are compiled ahead of time for `bmg-g21`.
+
+**Windows**
 
 ```bat
 build.cmd
 ```
 
-This compiles the server, a CLI and the two converters, and copies them together with the oneAPI runtime DLLs into
-`bin\`. Building the GPU programs takes a few minutes because the kernels are compiled ahead of time for `bmg-g21`.
+The oneAPI runtime DLLs are copied into `bin\` as well. If oneAPI or Visual Studio are not in their default locations,
+set `ONEAPI_ROOT` (folder with `setvars.bat`) and/or `VSVARS` (path to `vcvars64.bat`). `SETVARS_ARGS` is passed to
+`setvars.bat`, e.g. `--config=oneapi.cfg` to select component versions when several are installed.
 
-If oneAPI or Visual Studio are not in their default locations, set `ONEAPI_ROOT` (folder with `setvars.bat`) and/or
-`VSVARS` (path to `vcvars64.bat`) before running `build.cmd`. `SETVARS_ARGS` is passed to `setvars.bat`, e.g.
-`--config=oneapi.cfg` to select component versions when several are installed.
+**Linux**
+
+```bash
+./build.sh
+```
+
+`ONEAPI_ROOT` defaults to `/opt/intel/oneapi`; `CXX` selects the compiler for the CPU-only tools (default `g++`).
+`start.sh` sources `setvars.sh` itself, so the oneAPI runtime is found at start.
 
 ## Convert the model
 
@@ -69,6 +81,8 @@ bin\pack.exe  path\to\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf models\Qwen3.6-35B-A3B-UD-Q
 bin\mktok.exe path\to\Qwen3.6-35B-A3B-UD-Q4_K_M.gguf models\Qwen3.6-35B-A3B-UD-Q4_K_M.tok
 ```
 
+On Linux the same with `bin/pack` and `bin/mktok`. The converted files are identical on both systems.
+
 The `.tok` file (tokenizer and chat template) must sit next to the `.q36` file under the same name. The GGUF is not
 needed afterwards. On the first run the server creates `<model>.q36.prof`, a small file with expert usage statistics
 that is used to warm up the cache on the next start.
@@ -76,10 +90,13 @@ that is used to warm up the cache on the next start.
 ## Run
 
 ```bat
-start.cmd
+start.cmd          :: Windows
+```
+```bash
+./start.sh         # Linux
 ```
 
-`start.cmd` uses `models\Qwen3.6-35B-A3B-UD-Q4_K_M.q36` unless `MODEL` is set, and passes extra arguments through
+Both use `models/Qwen3.6-35B-A3B-UD-Q4_K_M.q36` unless `MODEL` is set, and pass extra arguments through
 (`start.cmd --ctx 65536`). The API is then available at `http://127.0.0.1:9936/v1`; any OpenAI-compatible client works:
 
 ```bash
@@ -141,10 +158,11 @@ Loading takes ~2 s when the model file is in the OS file cache, otherwise it is 
 | `tools/server.cpp` | HTTP server |
 | `tools/q36.cpp` | CLI on token ids (benchmarks, `--kprof`) |
 | `tools/pack.cpp`, `tools/mktok.cpp` | GGUF → engine model file, GGUF → tokenizer file |
+| `build.cmd`, `start.cmd` / `build.sh`, `start.sh` | build and start scripts for Windows / Linux |
 
 ## Limitations
 
-- One model, one GPU architecture, Windows only.
+- One model, one GPU architecture.
 - One request at a time; text only (no vision); no context shift — a prompt that does not fit is rejected.
 
 ## License

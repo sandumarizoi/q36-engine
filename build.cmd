@@ -18,7 +18,7 @@ if not exist "%ROOT%bin" mkdir "%ROOT%bin"
 cd /d "%ROOT%build"
 
 rem GPU programs: SYCL + ESIMD, kernels compiled ahead of time for the Arc B580 (Xe2, bmg-g21)
-set GPUFLAGS=-D_CRT_SECURE_NO_WARNINGS -fsycl -O2 /arch:AVX2 /EHsc -fsycl-targets=spir64_gen -Xs "-device bmg-g21"
+set GPUFLAGS=-fsycl -O2 /arch:AVX2 /EHsc -fsycl-targets=spir64_gen -Xs "-device bmg-g21"
 echo [1/4] q36-server
 icx %GPUFLAGS% ..\tools\server.cpp -o q36-server.exe ws2_32.lib || goto fail
 echo [2/4] q36 (CLI)

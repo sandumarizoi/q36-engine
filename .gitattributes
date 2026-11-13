@@ -1,0 +1,5 @@
+*.sh  text eol=lf
+*.cmd text eol=crlf
+*.hpp text eol=lf
+*.cpp text eol=lf
+*.md  text eol=lf
