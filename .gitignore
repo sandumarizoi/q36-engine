@@ -1,0 +1,11 @@
+build/
+bin/
+models/
+*.exe
+*.obj
+*.q36
+*.tok
+*.prof
+*.gguf
+*.buildlog
+build.out
