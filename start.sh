@@ -6,4 +6,4 @@ root="$(cd "$(dirname "$0")" && pwd)"
 MODEL="${MODEL:-$root/models/Qwen3.6-35B-A3B-UD-Q4_K_M.q36}"
 [ -f "$MODEL" ] || { echo "Model not found: $MODEL (set MODEL or put the files into models/)"; exit 1; }
 source "${ONEAPI_ROOT:-/opt/intel/oneapi}/setvars.sh" --force >/dev/null 2>&1 || true
-exec "$root/bin/q36-server" "$MODEL" --ctx 32768 --vram-gb 10.5 --mtp 2 --port 9936 "$@"
+exec "$root/bin/q36-server" "$MODEL" --ctx 32768 --vram-gb 10.5 --mtp 3 --port 9936 "$@"

@@ -13,7 +13,7 @@ namespace es = sycl::ext::intel::esimd;
 constexpr int NCMAX = 8;      // max tokens per step (decode = 1, MTP verify up to NCMAX)
 constexpr int RING = 16;      // GDN per-position ring (conv inputs, q/k/v, update records)
 constexpr int RMASK = RING - 1;
-constexpr int ATT_CH_MAX = 64; // attention chunk (keys per ESIMD thread): 16, 32 or 64, chosen from the context depth
+constexpr int ATT_CH_MAX = 1024; // attention chunk (keys per ESIMD thread, a multiple of 16), chosen from the context depth
 constexpr int ATT_NCH_MAX = 1024;
 
 struct Act { int8_t * q; float * d; float * s; };
@@ -145,8 +145,11 @@ static inline sycl::event k_gemv_f32(sycl::queue & q, const float * W, int rows,
 }
 
 // f32 mat-vec, NC columns: work-group of 8 threads per 4 rows, thread = 1/8 of the columns, 64-wide loads, SLM reduce
+// G != nullptr (alpha/beta of a delta-net layer, rows = 64): instead of y, write the gates of the ring slot of every column:
+// G[slot][h] = exp(softplus(alpha_h + dt_h) * a_h), G[slot][32 + h] = sigmoid(beta_h)   (what k_gdn_gates computes)
 template <int NC>
-static inline sycl::event k_gemv_f32n(sycl::queue & q, const float * W, int rows, int n, const float * x, float * y, int ystride) {
+static inline sycl::event k_gemv_f32n(sycl::queue & q, const float * W, int rows, int n, const float * x, float * y, int ystride,
+                                      const int * prm = nullptr, const float * par_dt = nullptr, const float * par_a = nullptr, float * G = nullptr) {
     return q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((rows + 3) / 4) * 8), sycl::range<1>(8)), [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
         slm_init<8 * 4 * NC * 4>();
         const int r0 = (int) it.get_group(0) * 4, t = (int) it.get_local_id(0); const int per = n / 8;
@@ -179,7 +182,12 @@ static inline sycl::event k_gemv_f32n(sycl::queue & q, const float * W, int rows
             for (int c = 0; c < NC; c++) { float s = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; j++) s += slm_scalar_load<float>(((j * 4 + t) * NC + c) * 4);
-                y[(size_t) c * ystride + r0 + t] = s; }
+                if (G) {
+                    const int r = r0 + t; float * g = G + (size_t) ((prm[0] + c) & RMASK) * 64;
+                    if (r < 32) { simd<float, 1> al = s + par_dt[r]; simd<float, 1> sp = es::log(es::exp(al) + 1.0f); sp.merge(al, al > 20.0f);
+                                  simd<float, 1> gv = es::exp(sp * par_a[r]); g[r] = gv[0]; }
+                    else { simd<float, 1> bv = simd<float, 1>(1.0f) / (es::exp(-simd<float, 1>(s)) + 1.0f); g[r] = bv[0]; }
+                } else y[(size_t) c * ystride + r0 + t] = s; }
         }
     });
 }
@@ -273,39 +281,40 @@ static inline sycl::event k_gdn_post(sycl::queue & q, int nc, const int * prm, c
     });
 }
 
-// ---------------------------------------------------------------- attention with an int8 K/V cache
-// Per (position, kv head): K = 256 int8 in "block-interleaved" order + 16 floats (the 8 block scales, twice);
-// V = 256 int8 (natural order) + 8 block scales. Interleaved order: stored dword m*8+b = dword m of block b (32 dims), so
-// lane L of every 16-lane dp4a belongs to block L%8 and one multiply by the scale vector finishes the dot product.
-struct KV { int8_t * kq; float * ks; int8_t * vq; float * vs; };
+// ---------------------------------------------------------------- attention: int8 K/V cache in XMX tile layout
+// Per kv head (2) and tile of 16 positions t (tb = kvh * ntile + t):
+//   kt[tb][b]  512 B : int8 VNNI tile of block b (32 dims): dword k4 * 16 + n = dims 4 k4 .. 4 k4 + 3 of position 16 t + n
+//   ks[tb][b][16]    : K block scales;   vs[tb][b][16]: V block scales
+//   vt[tb][g]  256 B : int8 V of dims 16 g .. 16 g + 15 in fp16-VNNI order: byte (k2 * 16 + d) * 2 + j = position 2 k2 + j, dim d
+// Queries go to QN[c][kvh][b] = 8 heads x 32 int8 (natural order) and QSN[c][kvh][b][8] = scales / 16 (1/sqrt(256) folded in).
+struct KV { int8_t * kt; float * ks; int8_t * vt; float * vs; int ntile; };
 
-// quantize a 256-vector (16 simd) per block of 32 and store it interleaved: q[256], sc[16]
-static ESIMD_INLINE void quant256_il(simd<float, 16> * v, int8_t * qp, float * sp) {
-    simd<uint32_t, 64> out; simd<float, 16> sc;
-#pragma unroll
-    for (int b = 0; b < 8; b++) {
-        const float amax = hmax<float>((es::max)(es::abs(v[2 * b]), es::abs(v[2 * b + 1])));
-        const float d = amax / 127.0f; const float id = d > 0.0f ? 1.0f / d : 0.0f;
-        simd<int8_t, 32> q8;
-        q8.select<16, 1>(0) = convert<int8_t>(rnde<int, 16>(v[2 * b] * id)); q8.select<16, 1>(16) = convert<int8_t>(rnde<int, 16>(v[2 * b + 1] * id));
-        simd<uint32_t, 8> q32 = q8.bit_cast_view<uint32_t>();
-        out.select<8, 8>(b) = q32;
-        sc.select<1, 1>(b) = d; sc.select<1, 1>(8 + b) = d;
-    }
-    simd<int8_t, 256> o8 = out.bit_cast_view<int8_t>();
-    block_store<int8_t, 256>(qp, o8); block_store<float, 16>(sp, sc);
+static ESIMD_INLINE float quant32_q(simd<float, 16> a0, simd<float, 16> a1, simd<int8_t, 32> & q) {
+    const float amax = hmax<float>((es::max)(es::abs(a0), es::abs(a1)));
+    const float d = amax / 127.0f; const float id = d > 0.0f ? 1.0f / d : 0.0f;
+    q.select<16, 1>(0) = convert<int8_t>(rnde<int, 16>(a0 * id)); q.select<16, 1>(16) = convert<int8_t>(rnde<int, 16>(a1 * id));
+    return d;
 }
 
 // per-head prep, one thread per (column, unit): 16 q heads, 2 k heads, 2 v heads.
 // Y1[c][9216] = q (16 x [q 256 | gate 256]), k (2 x 256), v (2 x 256); rope[c][64] = 32 cos, 32 sin
 static inline sycl::event k_att_prep(sycl::queue & q, int nc, const int * prm, const float * Y1, const float * qw, const float * kw, float eps, const float * rope,
-                                     int8_t * QQ, float * QS, KV kv) {
+                                     int8_t * QN, float * QSN, KV kv) {
     return q.parallel_for(sycl::range<1>(nc * 20), [=](sycl::id<1> id) [[intel::sycl_explicit_simd]] {
         const int P = prm[0]; const int c = (int) id[0] / 20, u = (int) id[0] % 20; const float * y = Y1 + c * 9216;
-        if (u >= 18) { // v head: natural order, scale per 32
-            const int vh = u - 18; const float * v = y + 8704 + vh * 256; const size_t rec = (size_t) (P + c) * 2 + vh; float dummy[2];
+        const int pos = P + c; const int t = pos / 16, n = pos % 16;
+        if (u >= 18) { // v head
+            const int kvh = u - 18; const float * v = y + 8704 + kvh * 256; const size_t tb = (size_t) kvh * kv.ntile + t;
+            simd<uint32_t, 16> d16(0u, 1u); simd<uint32_t, 16> boff = (((n >> 1) * 16u) + d16) * 2u + (uint32_t) (n & 1);
 #pragma unroll
-            for (int b = 0; b < 8; b++) quant32(block_load<float, 16>(v + 32 * b), block_load<float, 16>(v + 32 * b + 16), kv.vq + rec * 256 + 32 * b, kv.vs + rec * 8 + b, dummy);
+            for (int b = 0; b < 8; b++) {
+                simd<int8_t, 32> qb; const float d = quant32_q(block_load<float, 16>(v + 32 * b), block_load<float, 16>(v + 32 * b + 16), qb);
+                kv.vs[(tb * 8 + b) * 16 + n] = d;
+#pragma unroll
+                for (int h = 0; h < 2; h++) { const int g = 2 * b + h;
+                    simd<uint8_t, 16> vv = qb.select<16, 1>(16 * h).bit_cast_view<uint8_t>();
+                    scatter<uint8_t, 16>((uint8_t *) kv.vt + (tb * 16 + g) * 256, boff, vv); }
+            }
             return;
         }
         const bool isk = u >= 16; const float * src = isk ? y + 8192 + (u - 16) * 256 : y + u * 512; const float * nw = isk ? kw : qw;
@@ -322,85 +331,19 @@ static inline sycl::event k_att_prep(sycl::queue & q, int nc, const int * prm, c
             simd<float, 16> a = v[i], b = v[i + 2];
             v[i] = a * cs - b * sn; v[i + 2] = a * sn + b * cs;
         }
-        if (isk) { const size_t rec = (size_t) (P + c) * 2 + (u - 16); quant256_il(v, kv.kq + rec * 256, kv.ks + rec * 16); }
-        else     { const size_t rec = (size_t) c * 16 + u; quant256_il(v, QQ + rec * 256, QS + rec * 16); }
-    });
-}
-
-// one thread per (column, pair of q heads, chunk of prm[3] <= 64 keys); online softmax per chunk.
-// partial result PART[c][h][chunk][272]: m (max score), l (sum exp(s - m)), pad, o[256] at +16 = sum exp(s - m) * v
-static inline sycl::event k_att(sycl::queue & q, int nc, const int * prm, int nch, const int8_t * QQ, const float * QS, KV kv, float * PART) {
-    return q.parallel_for(sycl::range<1>((size_t) nc * 8 * nch), [=](sycl::id<1> id) [[intel::sycl_explicit_simd]] {
-        const int ch = (int) (id[0] % nch); const int g8 = (int) (id[0] / nch) % 8; const int c = (int) (id[0] / nch) / 8;
-        if (ch >= prm[2]) return;
-        const int P = prm[0], cht = prm[3]; const int kvh = g8 / 4; const int h0 = g8 * 2; const int t0 = ch * cht;
-        int lim = P + c + 1 - t0; if (lim > cht) lim = cht;
-        float * out = PART + (((size_t) c * 16 + h0) * nch + ch) * 272; const size_t ostride = (size_t) nch * 272;
-        if (lim <= 0) {
-#pragma unroll
-            for (int i = 0; i < 2; i++) { out[i * ostride] = -1e30f; out[i * ostride + 1] = 0.0f; }
-            return;
-        }
-        simd<int, 16> qv[2][4]; simd<float, 16> qs[2];
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const size_t rec = (size_t) c * 16 + h0 + i;
-            simd<int8_t, 256> q8 = block_load<int8_t, 256>(QQ + rec * 256); simd<int, 64> q32 = q8.bit_cast_view<int>();
-#pragma unroll
-            for (int j = 0; j < 4; j++) qv[i][j] = q32.select<16, 1>(16 * j);
-            qs[i] = block_load<float, 16>(QS + rec * 16) * 0.0625f; // 1/sqrt(256) folded in
-        }
-        simd<float, 16> sc[2][4];
-#pragma unroll
-        for (int i = 0; i < 2; i++)
-#pragma unroll
-            for (int g = 0; g < 4; g++) sc[i][g] = -1e30f;
-        for (int tk = 0; tk < lim; tk++) {
-            const size_t rec = (size_t) (t0 + tk) * 2 + kvh;
-            simd<int8_t, 256> k8 = block_load<int8_t, 256>(kv.kq + rec * 256); simd<int, 64> k32 = k8.bit_cast_view<int>();
-            simd<float, 16> ks = block_load<float, 16>(kv.ks + rec * 16);
-            simd<int, 16> k0 = k32.select<16, 1>(0), k1 = k32.select<16, 1>(16), k2 = k32.select<16, 1>(32), k3 = k32.select<16, 1>(48);
-#pragma unroll
-            for (int i = 0; i < 2; i++) {
-                simd<int, 16> a = dp4a<int, int, int, int, 16>(simd<int, 16>(0), qv[i][0], k0);
-                a = dp4a<int, int, int, int, 16>(a, qv[i][1], k1); a = dp4a<int, int, int, int, 16>(a, qv[i][2], k2); a = dp4a<int, int, int, int, 16>(a, qv[i][3], k3);
-                const float s = reduce<float>(convert<float>(a) * qs[i] * ks, std::plus<>{});
-                sc[i][tk >> 4][tk & 15] = s;
-            }
-        }
-        float m[2], l[2];
-#pragma unroll
-        for (int i = 0; i < 2; i++) {
-            float mx = -1e30f;
-#pragma unroll
-            for (int g = 0; g < 4; g++) { const float v = hmax<float>(sc[i][g]); if (v > mx) mx = v; }
-            float sum = 0.0f;
-#pragma unroll
-            for (int g = 0; g < 4; g++) { sc[i][g] = es::exp(sc[i][g] - mx); sum += reduce<float>(sc[i][g], std::plus<>{}); }
-            m[i] = mx; l[i] = sum;
-        }
-        simd<float, 16> acc[2][16];
-#pragma unroll
-        for (int i = 0; i < 2; i++)
-#pragma unroll
-            for (int k = 0; k < 16; k++) acc[i][k] = 0.0f;
-        for (int tk = 0; tk < lim; tk++) {
-            const size_t rec = (size_t) (t0 + tk) * 2 + kvh;
-            simd<int8_t, 256> v8 = block_load<int8_t, 256>(kv.vq + rec * 256);
-            simd<float, 8> vs = block_load<float, 8>(kv.vs + rec * 8);
-            const float w0 = sc[0][tk >> 4][tk & 15], w1 = sc[1][tk >> 4][tk & 15];
+        if (isk) {
+            const int kvh = u - 16; const size_t tb = (size_t) kvh * kv.ntile + t;
+            simd<uint32_t, 8> k4(0u, 1u); simd<uint32_t, 8> doff = (k4 * 16u + (uint32_t) n) * 4u;
 #pragma unroll
             for (int b = 0; b < 8; b++) {
-                const float d = vs[b]; const float a0 = w0 * d, a1 = w1 * d;
-                simd<float, 16> x0 = convert<float>(simd<int8_t, 16>(v8.select<16, 1>(32 * b))), x1 = convert<float>(simd<int8_t, 16>(v8.select<16, 1>(32 * b + 16)));
-                acc[0][2 * b] += x0 * a0; acc[0][2 * b + 1] += x1 * a0; acc[1][2 * b] += x0 * a1; acc[1][2 * b + 1] += x1 * a1;
+                simd<int8_t, 32> qb; const float d = quant32_q(v[2 * b], v[2 * b + 1], qb);
+                kv.ks[(tb * 8 + b) * 16 + n] = d;
+                scatter<uint32_t, 8>((uint32_t *) (kv.kt + (tb * 8 + b) * 512), doff, qb.bit_cast_view<uint32_t>());
             }
-        }
+        } else {
+            const int kvh = u / 8, m = u % 8; int8_t * qn = QN + ((size_t) c * 16 + kvh * 8) * 256 + m * 32; float * qs = QSN + ((size_t) c * 16 + kvh * 8) * 8 + m;
 #pragma unroll
-        for (int i = 0; i < 2; i++) {
-#pragma unroll
-            for (int k = 0; k < 16; k++) block_store<float, 16>(out + i * ostride + 16 + 16 * k, acc[i][k]);
-            out[i * ostride] = m[i]; out[i * ostride + 1] = l[i];
+            for (int b = 0; b < 8; b++) { simd<int8_t, 32> qb; const float d = quant32_q(v[2 * b], v[2 * b + 1], qb); block_store<int8_t, 32>(qn + b * 256, qb); qs[b * 8] = d * 0.0625f; }
         }
     });
 }
@@ -637,6 +580,52 @@ static ESIMD_INLINE float q4k_block(simd<uint32_t, 32> q32, simd<float, 8> scale
 }
 
 // gate/up + SwiGLU for the cached experts: one thread per (column, used expert u, hidden unit i) -> ACT[c][1 + u][i] (0 if not cached)
+// fused version: groups of 32 threads (32 hidden units of one column / slot), the values meet in SLM and are quantized into
+// aq (vector c * 9 + 1 + u); groups past nc * 8 * 16 quantize the shared expert (vector c * 9) from GU. Replaces k_act_quant.
+static inline sycl::event k_exp_glu_q(sycl::queue & q, int nc, const uint64_t * TAB, const int * ids, Act a, const float * GU, Act aq) {
+    const size_t ng = (size_t) nc * 8 * 16 + (size_t) nc * 16;
+    return q.parallel_for(sycl::nd_range<1>(sycl::range<1>(ng * 32), sycl::range<1>(32)), [=](sycl::nd_item<1> it) [[intel::sycl_explicit_simd]] {
+        slm_init<32 * 4>();
+        const size_t gi = it.get_group(0); const int t = (int) it.get_local_id(0);
+        if (gi >= (size_t) nc * 8 * 16) { // shared expert: one group = 32 values of vector 0 of column c
+            if (t != 0) return;
+            const size_t k = gi - (size_t) nc * 8 * 16; const int c = (int) (k / 16), b = (int) (k % 16);
+            const float * gp = GU + (size_t) c * 1024 + 64 * b; simd<float, 32> t0 = block_load<float, 32>(gp), t1 = block_load<float, 32>(gp + 32);
+            const size_t vec = (size_t) c * 9;
+            quant32(silu16(t0.select<16, 2>(0)) * t0.select<16, 2>(1), silu16(t1.select<16, 2>(0)) * t1.select<16, 2>(1), aq.q + vec * 512 + 32 * b, aq.d + vec * 16 + b, aq.s + vec * 32 + 2 * b);
+            return;
+        }
+        const int b = (int) (gi % 16); const int u = (int) (gi / 16) % 8; const int c = (int) (gi / 16) / 8; const int i = 32 * b + t;
+        const uint8_t * rec = (const uint8_t *) TAB[ids[c * 8 + u]];
+        float val = 0.0f;
+        if (rec) {
+            const uint8_t * wg = rec + (size_t) (2 * i) * 1152; const uint8_t * wu = wg + 1152;
+            simd<uint8_t, 128> mg = block_load<uint8_t, 128>(wg + 1024), mu = block_load<uint8_t, 128>(wu + 1024);
+            simd<sycl::half, 16> dmg = block_load<sycl::half, 16>((const sycl::half *) (wg + 1120)), dmu = block_load<sycl::half, 16>((const sycl::half *) (wu + 1120));
+            simd<float, 16> fg = convert<float>(dmg), fu = convert<float>(dmu);
+            float sg = 0.0f, su = 0.0f;
+            for (int bb = 0; bb < 8; bb++) {
+                simd<int8_t, 256> x8 = block_load<int8_t, 256>(a.q + c * 2048 + 256 * bb); simd<int, 64> x32 = x8.bit_cast_view<int>();
+                simd<float, 8> xd = block_load<float, 8>(a.d + c * 64 + 8 * bb); simd<float, 16> xs = block_load<float, 16>(a.s + c * 128 + 16 * bb);
+                simd<float, 8> scf, mnf;
+                simd<uint8_t, 128> qg = block_load<uint8_t, 128>(wg + 128 * bb);
+                k4_unpack(mg.select<12, 1>(12 * bb), fg[2 * bb], fg[2 * bb + 1], scf, mnf);
+                sg += q4k_block(qg.bit_cast_view<uint32_t>(), scf, mnf, x32, xd, xs);
+                simd<uint8_t, 128> qu = block_load<uint8_t, 128>(wu + 128 * bb);
+                k4_unpack(mu.select<12, 1>(12 * bb), fu[2 * bb], fu[2 * bb + 1], scf, mnf);
+                su += q4k_block(qu.bit_cast_view<uint32_t>(), scf, mnf, x32, xd, xs);
+            }
+            simd<float, 1> g(sg); simd<float, 1> sl = g / (es::exp(-g) + 1.0f); val = sl[0] * su;
+        }
+        slm_scalar_store<float>(t * 4, val);
+        barrier();
+        if (t == 0) {
+            const size_t vec = (size_t) c * 9 + 1 + u;
+            quant32(slm_block_load<float, 16>(0), slm_block_load<float, 16>(64), aq.q + vec * 512 + 32 * b, aq.d + vec * 16 + b, aq.s + vec * 32 + 2 * b);
+        }
+    });
+}
+
 static inline sycl::event k_exp_glu(sycl::queue & q, int nc, const uint64_t * TAB, const int * ids, Act a, float * ACT) {
     return q.parallel_for(sycl::range<1>((size_t) nc * 8 * 512), [=](sycl::id<1> id) [[intel::sycl_explicit_simd]] {
         const int i = (int) id[0] % 512; const int u = (int) (id[0] / 512) % 8; const int c = (int) (id[0] / 512) / 8;
@@ -752,6 +741,33 @@ static inline sycl::event k_down(sycl::queue & q, const uint8_t * Wsh, int nc, c
                 y += wts[c * 8 + u] * sum;
             }
             Y2[c * 2048 + r] = y;
+        }
+    });
+}
+
+// ---------------------------------------------------------------- logits -> sampling candidates on the GPU (plain SYCL)
+// per column a block of ints: [0] number of candidates found (may exceed the capacity), [1] maximum logit (float bits),
+// then (index, value bits) pairs of every logit >= max - W, in no particular order.
+constexpr int CAND_CAP = 8192, CAND_BLK = 2 + 2 * CAND_CAP;
+static inline sycl::event k_cand(sycl::queue & q, const float * L, int n, int ld, int nc, float W, int * blk) {
+    constexpr int per = 4; constexpr size_t wg = 256; const size_t ni = ((size_t) n + per - 1) / per, ng = (ni + wg - 1) / wg;
+    q.parallel_for(sycl::range<1>(nc), [=](sycl::id<1> c) { blk[c * CAND_BLK] = 0; ((float *) blk)[c * CAND_BLK + 1] = -1e30f; });
+    q.parallel_for(sycl::nd_range<1>(sycl::range<1>(nc * ng * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> it) {
+        const size_t g = it.get_group(0); const size_t c = g / ng; const size_t i0 = ((g % ng) * wg + it.get_local_id(0)) * per;
+        const float * l = L + c * ld; float m = -1e30f;
+        for (int k = 0; k < per; k++) if (i0 + k < (size_t) n) m = sycl::fmax(m, l[i0 + k]);
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        if (it.get_local_id(0) == 0) sycl::atomic_ref<float, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(((float *) blk)[c * CAND_BLK + 1]).fetch_max(m);
+    });
+    return q.parallel_for(sycl::nd_range<1>(sycl::range<1>(nc * ng * wg), sycl::range<1>(wg)), [=](sycl::nd_item<1> it) {
+        const size_t g = it.get_group(0); const size_t c = g / ng; const size_t i0 = ((g % ng) * wg + it.get_local_id(0)) * per;
+        const float * l = L + c * ld; int * b = blk + c * CAND_BLK; const float thr = ((const float *) b)[1] - W;
+        for (int k = 0; k < per; k++) {
+            const size_t i = i0 + k; if (i >= (size_t) n) break; const float v = l[i];
+            if (v >= thr) {
+                const int s = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device, sycl::access::address_space::global_space>(b[0]).fetch_add(1);
+                if (s < CAND_CAP) { b[2 + 2 * s] = (int) i; ((float *) b)[3 + 2 * s] = v; }
+            }
         }
     });
 }

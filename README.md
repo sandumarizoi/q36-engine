@@ -25,15 +25,15 @@ It ships as an OpenAI-compatible HTTP server and builds on Windows and Linux.
 ## Performance
 
 Test system: Arc B580 12 GB (PCIe 3.0 x8), Ryzen 5 5500, 32 GB DDR4-3600, Windows 11. Server defaults
-(`--ctx 32768 --vram-gb 10.5 --mtp 2`), single request. Speeds on Linux (Fedora 44) are on par.
+(`--ctx 32768 --vram-gb 10.5 --mtp 3`), single request. Linux (Fedora 44) is supported as well.
 
 | workload | tokens/s |
 |---|---|
-| code generation (greedy / sampled) | 128–133 / 128 |
-| Ukrainian prose | 126–141 |
-| follow-up turn with reasoning (Ukrainian) | 122 |
-| generation after a 16k-token prompt | 94 |
-| generation after a 30k-token prompt (`--ctx 65536`) | 83 |
+| code generation (greedy / sampled) | 146–157 |
+| Ukrainian prose | 141–153 |
+| follow-up turn with reasoning (Ukrainian) | 135 |
+| generation after a 16k-token prompt | 106 |
+| generation after a 30k-token prompt (`--ctx 65536`) | 95 |
 | prompt processing, 3k–16k tokens | 1100–1400 |
 | prompt processing, 30k tokens | 1100 |
 
@@ -112,17 +112,18 @@ Loading takes ~2 s when the model file is in the OS file cache, otherwise it is 
 | `--ctx N` | 32768 | context length in tokens (K/V cache: ~13 KB per token) |
 | `--vram-gb X` | 10.5 | total VRAM the engine may use; everything left after the model and context goes to the expert cache |
 | `--cache-gb X` | | expert cache size, overrides `--vram-gb` |
-| `--mtp N` | 2 | maximum MTP draft depth (0 = off, up to 7) |
+| `--mtp N` | 3 | maximum MTP draft depth (0 = off, up to 7) |
 | `--prefill-window N` | 4096 | window size of the GPU prompt path (0 = always step by step) |
 | `--prefill-min N` | 512 | prompts shorter than this are processed step by step |
 | `--port N`, `--host A` | 9936, 127.0.0.1 | listen address |
-| `--threads N` | 6 | CPU threads for cache misses |
+| `--threads N` | 8 | CPU threads for cache misses |
 | `--tok F`, `--profile F` | next to the model | tokenizer file, expert usage profile |
 | `--draft-vocab N` | 65536 | MTP drafts are computed over the first N vocabulary rows plus all Cyrillic tokens |
 | `--draft-vocab-extra F` | | file with additional token ids for drafts (replaces the automatic Cyrillic set) |
 | `--lookup 1` | 0 | experimental prompt-lookup drafts |
 | `--alias S` | Qwen3.6-35B-A3B-q36 | model name reported by `/v1/models` |
-| `--log-level N`, `--log-interval S` | 1, 1 | progress lines during prefill and generation (2 = with a per-token time breakdown) |
+| `--log-level N`, `--log-interval S` | 1, 1 | progress lines during prefill and generation; each request ends with a per-token time breakdown |
+| `--prefault 1` | 0 | map the whole model file into memory at start (steadier first request, ~23 GB resident) |
 
 ### Request fields
 
@@ -137,7 +138,8 @@ Loading takes ~2 s when the model file is in the OS file cache, otherwise it is 
   between RAM and VRAM.
 - **Decode.** Each layer runs as two recorded SYCL graphs: attention / Gated DeltaNet plus router, then the cached experts.
   Between them the host computes the missed experts with AVX2 int8 kernels. A background thread uploads experts that became
-  hot and evicts cold ones.
+  hot and evicts cold ones. The K/V cache (int8) is stored in tiles of 16 positions laid out for XMX, so decode attention
+  and prompt attention read it directly. Logits stay on the GPU: only the sampling candidates are copied to the host.
 - **MTP.** Drafts come from the model's MTP block and are verified in one batched step; rejected positions are simply
   overwritten, because the recurrent state is applied one step late.
 - **Prompt processing.** A window of tokens is processed layer by layer. All matrix work uses XMX: Q8_0 GEMM on activation

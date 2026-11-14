@@ -51,6 +51,27 @@ struct Sampler {
             if (sp.top_k <= 0 || (int) cand.size() >= sp.top_k || width > 60.0f) break;
             width *= 2.0f;
         }
+        return finish(m, sp);
+    }
+    // the same choice from the candidates the GPU kept (logits >= max - W). full = true: they are not enough, use sample()
+    // with the full logits instead (decided before any random number is drawn, so both paths give identical results)
+    int sample_cands(const int * blk, const SParams & sp, float W, bool & full) {
+        full = false; const int cnt = blk[0]; float m; memcpy(&m, blk + 1, 4);
+        if (cnt <= 0 || cnt > q36g::CAND_CAP) { full = true; return 0; }
+        auto val = [&](int k) { float v; memcpy(&v, blk + 3 + 2 * k, 4); return v; };
+        if (sp.temp <= 0.0f) { int best = INT32_MAX; for (int k = 0; k < cnt; k++) if (val(k) == m) best = std::min(best, blk[2 + 2 * k]); if (best == INT32_MAX) full = true; return best; }
+        float width = 16.0f;
+        for (;;) {
+            cand.clear(); for (int k = 0; k < cnt; k++) { const float v = val(k); if (v >= m - width) cand.push_back({ v, blk[2 + 2 * k] }); }
+            if (sp.top_k <= 0 || (int) cand.size() >= sp.top_k || width > 60.0f) break;
+            // fewer than top_k tokens within the window: the model is confident; the tokens further down have < 1e-7 of the
+            // probability each, and top_p < 1 drops them anyway, so the window is enough. With top_p = 1 use the full logits.
+            if (sp.top_p < 1.0f && !cand.empty()) break;
+            width *= 2.0f; if (width > W) { full = true; return 0; }
+        }
+        return finish(m, sp);
+    }
+    int finish(float m, const SParams & sp) {
         auto gt = [](const std::pair<float, int> & a, const std::pair<float, int> & b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
         if (sp.top_k > 0 && (int) cand.size() > sp.top_k) { std::partial_sort(cand.begin(), cand.begin() + sp.top_k, cand.end(), gt); cand.resize(sp.top_k); }
         else std::sort(cand.begin(), cand.end(), gt);
@@ -71,7 +92,7 @@ struct Session {
     Engine & e; Tokenizer & tk; std::vector<int> ctx; std::vector<Engine::Ckpt> ckpts; std::vector<float> logits, dl; Sampler smp;
     int mtp_max = 0, pf_min = 512; double p_acc[q36g::NCMAX] = { 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7, 0.7 };
     int tok_think_end, tok_tool, tok_tool_end, tok_im_end, tok_eos;
-    long st_prompt_n = 0, st_gen_n = 0, st_drafted = 0, st_accepted = 0, st_lk_drafted = 0, st_lk_accepted = 0; int lookup = 0; bool lk_streak = false; double lk_S = 2, lk_F = 1, cost_F = 6e-3, cost_C = 2.5e-3, cost_D = 1.6e-3; double st_prompt_s = 0, st_gen_s = 0;
+    long st_prompt_n = 0, st_gen_n = 0, st_drafted = 0, st_accepted = 0, st_lk_drafted = 0, st_lk_accepted = 0; long n_full = 0, n_check = 0, n_mismatch = 0; int lookup = 0; bool lk_streak = false; double lk_S = 2, lk_F = 1, cost_F = 6e-3, cost_C = 2.5e-3, cost_D = 1.6e-3; double st_prompt_s = 0, st_gen_s = 0; double tb0[5] = { 0, 0, 0, 0, 0 };
     // progress log: every log_interval seconds one line with the current speed (0 = off); log_level 2 adds the time split per token
     double log_interval = 1.0; int log_level = 1;
     struct Prog { double t_last = 0; long n_last = 0, hits = 0, misses = 0, drafted = 0, accepted = 0, steps = 0; double sub = 0, gpu = 0, cpu = 0, head = 0; } pg;
@@ -167,6 +188,7 @@ struct Session {
     int draft_depth() const { int d = 0; double p = 1.0; while (d < mtp_max) { p *= p_acc[d]; if (d > 0 && p < 0.5) break; d++; } return d; }
     // generate up to max_new tokens; on_token(id) returns false to stop. Returns the finish reason.
     template <class F> const char * generate(int max_new, const SParams & sp, F && on_token) {
+        tb0[0] = e.t_cpu; tb0[1] = e.t_gpu_wait; tb0[2] = e.t_submit; tb0[3] = e.t_head; tb0[4] = e.t_maint;
         const double t0 = now_s(); st_gen_n = 0; st_drafted = st_accepted = st_lk_drafted = st_lk_accepted = 0; prog_start();
         int next = smp.sample(logits.data(), e.n_vocab, sp); const char * reason = "length";
         while (st_gen_n < max_new) {
@@ -189,8 +211,7 @@ struct Session {
                 int tok = next;
                 for (int k = 0; k < depth; k++) {
                     e.embed(tok, e.h_embm); e.q.memcpy(e.HIN, k == 0 ? e.Hp : e.HM, 2048 * 4);
-                    e.mtp_step(1, n + k, false, dl.data());
-                    const int nr = e.draft_rows_d ? e.n_draft_rows : e.n_vocab; int best = (int) (std::max_element(dl.begin(), dl.begin() + nr) - dl.begin()); if (e.draft_rows_d) best = e.draft_rows_h[best];
+                    int best = 0; e.mtp_step(1, n + k, false, nullptr, &best);
                     if (best == tok_im_end || best == tok_eos) break; // do not draft past the end of the turn
                     drafts[nd++] = best; tok = best;
                 }
@@ -198,13 +219,19 @@ struct Session {
             const int nc = 1 + nd;
             e.embed(next, e.h_emb); for (int k = 0; k < nd; k++) e.embed(drafts[k], e.h_emb + (size_t) (k + 1) * 2048);
             const double ts0 = now_s(); if (nd > 0 && !lk) cost_D = 0.9 * cost_D + 0.1 * (ts0 - td0) / nd;
-            const double cpu0 = e.t_cpu; e.step(nc, true, logits.data());
+            e.cand_W = sp.temp <= 0.0f ? 0.0f : 16.0f; // greedy needs only the maximum, sampling the 16-nat window of the sampler
+            const double cpu0 = e.t_cpu; e.step(nc, true, nullptr); // logits stay on the GPU, candidates come back
+            auto samp_col = [&](int j) { const auto rng_before = smp.rng; bool full = false; int t = smp.sample_cands(e.h_cblk + (size_t) j * q36g::CAND_BLK, sp, e.cand_W, full);
+                static const bool check = getenv("Q36_CHECK_SAMPLER") != nullptr; // debugging: the full-logits path on a copy of the sampler must agree
+                if (check && !full) { Sampler ref = smp; ref.rng = rng_before; e.fetch_logits(j, logits.data() + (size_t) j * e.n_vocab, e.n_vocab);
+                    const int t2 = ref.sample(logits.data() + (size_t) j * e.n_vocab, e.n_vocab, sp); n_check++; if (t2 != t) n_mismatch++; }
+                if (full) { e.fetch_logits(j, logits.data() + (size_t) j * e.n_vocab, e.n_vocab); t = smp.sample(logits.data() + (size_t) j * e.n_vocab, e.n_vocab, sp); n_full++; } return t; };
             { const double dt = now_s() - ts0, dc = e.t_cpu - cpu0; cost_C = 0.9 * cost_C + 0.1 * std::max(1e-4, dc / nc); cost_F = 0.9 * cost_F + 0.1 * std::max(1e-3, dt - dc); }
             ctx.push_back(next); st_gen_n++; bool go = on_token(next);
-            int acc = 0; int samp = smp.sample(logits.data(), e.n_vocab, sp);
+            int acc = 0; int samp = samp_col(0);
             while (go && acc < nd && samp == drafts[acc] && st_gen_n < max_new) {
                 ctx.push_back(samp); st_gen_n++; go = on_token(samp); acc++;
-                samp = smp.sample(logits.data() + (size_t) acc * e.n_vocab, e.n_vocab, sp);
+                samp = samp_col(acc);
             }
             if (lk) { lk_streak = acc == nd; lk_S = 0.9 * lk_S + acc; lk_F = 0.9 * lk_F + (acc < nd ? 1 : 0); st_lk_drafted += nd; st_lk_accepted += acc; }
             else { for (int k = 0; k < nd; k++) { if (k < acc) p_acc[k] = 0.9 * p_acc[k] + 0.1; else if (k == acc) p_acc[k] = 0.9 * p_acc[k]; }
@@ -257,17 +284,21 @@ static size_t utf8_tail(const std::string & s) {
 
 int main(int argc, char ** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc < 2) { fprintf(stderr, "usage: q36-server model.q36 [--tok file.tok] [--port 9936] [--host 127.0.0.1] [--ctx 32768] [--vram-gb 10.5 | --cache-gb G] [--profile file] [--mtp 2] [--threads 6] [--draft-vocab 65536 --draft-vocab-extra file] [--alias name] [--log-interval 1] [--log-level 0|1|2] [--prefill-window 2048]\n"); return 1; }
-    std::string pack_path = argv[1], tok_path, prof, dv_extra, host = "127.0.0.1", alias = "Qwen3.6-35B-A3B-q36"; int port = 9936, ctx = 32768, n_threads = 6, mtp = 2, dv_keep = 65536, log_level = 1, pf_window = 4096, pf_min = 512, lookup = 0; double cache_gb = 0, vram_gb = 10.5, log_interval = 1.0;
+    if (argc < 2) { fprintf(stderr, "usage: q36-server model.q36 [--tok file.tok] [--port 9936] [--host 127.0.0.1] [--ctx 32768] [--vram-gb 10.5 | --cache-gb G] [--profile file] [--mtp 2] [--threads 6] [--draft-vocab 65536 --draft-vocab-extra file] [--alias name] [--prefault 1|0] [--log-interval 1] [--log-level 0|1|2] [--prefill-window 2048]\n"); return 1; }
+    std::string pack_path = argv[1], tok_path, prof, dv_extra, host = "127.0.0.1", alias = "Qwen3.6-35B-A3B-q36"; int port = 9936, ctx = 32768, n_threads = 8, mtp = 3, dv_keep = 65536, log_level = 1, pf_window = 4096, pf_min = 512, lookup = 0, prefault = 0; double cache_gb = 0, vram_gb = 10.5, log_interval = 1.0;
     for (int i = 2; i + 1 < argc; i += 2) {
         std::string a = argv[i]; const char * v = argv[i + 1];
         if (a == "--tok") tok_path = v; else if (a == "--port") port = atoi(v); else if (a == "--ctx") ctx = atoi(v); else if (a == "--cache-gb") cache_gb = atof(v); else if (a == "--vram-gb") vram_gb = atof(v); else if (a == "--profile") prof = v;
         else if (a == "--mtp") mtp = atoi(v); else if (a == "--threads") n_threads = atoi(v); else if (a == "--draft-vocab") dv_keep = atoi(v); else if (a == "--draft-vocab-extra") dv_extra = v;
-        else if (a == "--host") host = v; else if (a == "--log-interval") log_interval = atof(v); else if (a == "--log-level") log_level = atoi(v); else if (a == "--prefill-window") pf_window = atoi(v); else if (a == "--prefill-min") pf_min = atoi(v); else if (a == "--lookup") lookup = atoi(v); else if (a == "--alias") alias = v; else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 1; }
+        else if (a == "--host") host = v; else if (a == "--log-interval") log_interval = atof(v); else if (a == "--log-level") log_level = atoi(v); else if (a == "--prefill-window") pf_window = atoi(v); else if (a == "--prefill-min") pf_min = atoi(v); else if (a == "--lookup") lookup = atoi(v); else if (a == "--prefault") prefault = atoi(v); else if (a == "--alias") alias = v; else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 1; }
     }
     try {
         double t0 = now_s(); if (tok_path.empty()) { tok_path = pack_path; const size_t d = tok_path.rfind('.'); tok_path = tok_path.substr(0, d) + ".tok"; }
         Tokenizer tk; tk.load(tok_path); Pack pk; pk.open(pack_path); Pool pool(n_threads);
+        if (prefault) { // map every page of the model file into the process now: first touches during decode cost ~3 ms per token (soft faults)
+            const double tp = now_s(); std::atomic<uint64_t> sum{0}; const uint64_t n = pk.mm.n; const uint8_t * mp = pk.mm.p;
+            pool.pfor((int64_t) (n / 4096), [&](int64_t a, int64_t b) { uint64_t s = 0; for (int64_t i = a; i < b; i++) s += mp[(uint64_t) i * 4096]; sum += s; });
+            printf("model file mapped in: %.1f GB in %.1fs\n", n / 1e9, now_s() - tp); fflush(stdout); }
         { std::atomic<uint64_t> sum{0}; const uint64_t n = pk.mm.n; const uint8_t * p = pk.mm.p; // bring the pack into RAM
           pool.pfor((int64_t) (n / 4096), [&](int64_t a, int64_t b) { uint64_t s = 0; for (int64_t i = a; i < b; i++) s += p[(uint64_t) i * 4096]; sum += s; }); }
         printf("model in RAM: %.1f GB, %.1fs\n", pk.mm.n / 1e9, now_s() - t0);
@@ -276,6 +307,9 @@ int main(int argc, char ** argv) {
         Engine e(pk, pool, ctx, cache_gb > 0 ? cache_gb : -vram_gb, pf_window);
         const bool have_prof = e.cache->load_profile(prof);
         { std::vector<int> ncs = { 1, 8 }; for (int k = 2; k <= mtp + 1; k++) ncs.push_back(k); const std::vector<float> keep = e.cache->score; e.cache->rate = 0; e.warm_up(ncs, mtp > 0); e.cache->score = keep; e.cache->rate = 4; }
+        { auto envf = [](const char * n, double d) { const char * v = getenv(n); return v ? atof(v) : d; }; // tuning of the expert-cache policy
+          e.cache->rate = (int) envf("Q36_RATE", e.cache->rate); e.cache->rate_max = (int) envf("Q36_RATE_MAX", e.cache->rate_max); e.cache->rate_div = std::max(1, (int) envf("Q36_RATE_DIV", e.cache->rate_div));
+          e.cache->margin = (float) envf("Q36_MARGIN", e.cache->margin); if (getenv("Q36_HALFLIFE")) e.cache->decay = (float) pow(0.5, 1.0 / envf("Q36_HALFLIFE", 150)); }
         e.cache->prefill();
         if (dv_keep > 0 && mtp > 0) {
             std::vector<int> cyr; // without a list file: every token past n_keep that contains Cyrillic letters (drafts in Ukrainian etc.)
@@ -378,8 +412,11 @@ int main(int argc, char ** argv) {
                         J tm = J::obj(); tm.set("prompt_n", (int) ss.st_prompt_n); tm.set("prompt_ms", ss.st_prompt_s * 1e3); tm.set("prompt_per_second", ss.st_prompt_n / std::max(1e-9, ss.st_prompt_s));
                         tm.set("predicted_n", (int) ss.st_gen_n); tm.set("predicted_ms", ss.st_gen_s * 1e3); tm.set("predicted_per_second", ss.st_gen_n / std::max(1e-9, ss.st_gen_s));
                         tm.set("draft_n", (int) ss.st_drafted); tm.set("draft_n_accepted", (int) ss.st_accepted); tm.set("expert_cache_hit_rate", e.cache->hit_rate()); tm.set("lookup_n", (int) ss.st_lk_drafted); tm.set("lookup_n_accepted", (int) ss.st_lk_accepted);
-                        printf("req %ld done (%s): prompt %zu tok (%ld new, %.0f t/s), gen %ld tok %.1f t/s, drafts %ld/%ld (lookup %ld/%ld), cache hit %.3f, ctx %d\n", req_id, reason, prompt.size(), ss.st_prompt_n, ss.st_prompt_n / std::max(1e-9, ss.st_prompt_s),
-                               ss.st_gen_n, ss.st_gen_n / std::max(1e-9, ss.st_gen_s), ss.st_accepted, ss.st_drafted, ss.st_lk_accepted, ss.st_lk_drafted, e.cache->hit_rate(), e.n_past);
+                        printf("req %ld done (%s): prompt %zu tok (%ld new, %.0f t/s), gen %ld tok %.1f t/s, drafts %ld/%ld (lookup %ld/%ld), cache hit %.3f, ctx %d, sampler full/check/mismatch %ld/%ld/%ld, avg cands %.0f\n", req_id, reason, prompt.size(), ss.st_prompt_n, ss.st_prompt_n / std::max(1e-9, ss.st_prompt_s),
+                               ss.st_gen_n, ss.st_gen_n / std::max(1e-9, ss.st_gen_s), ss.st_accepted, ss.st_drafted, ss.st_lk_accepted, ss.st_lk_drafted, e.cache->hit_rate(), e.n_past, ss.n_full, ss.n_check, ss.n_mismatch, e.cand_n ? (double) e.cand_sum / e.cand_n : 0.0);
+                        if (log_level >= 1 && ss.st_gen_n > 0) { const double k = 1e3 / ss.st_gen_n;
+                            printf("  per generated token: %.2f ms = cpu experts %.2f, gpu wait %.2f, submit %.2f, head %.2f, cache upkeep %.2f, other %.2f\n", ss.st_gen_s * k, (e.t_cpu - ss.tb0[0]) * k, (e.t_gpu_wait - ss.tb0[1]) * k, (e.t_submit - ss.tb0[2]) * k, (e.t_head - ss.tb0[3]) * k, (e.t_maint - ss.tb0[4]) * k,
+                                   (ss.st_gen_s - (e.t_cpu - ss.tb0[0]) - (e.t_gpu_wait - ss.tb0[1]) - (e.t_submit - ss.tb0[2]) - (e.t_head - ss.tb0[3]) - (e.t_maint - ss.tb0[4])) * k); }
                         e.cache->hits = e.cache->misses = 0;
                         if (raw) { J o = J::obj(); o.set("content", full); J & ta = o.set("tokens", J::arr()); for (size_t i = prompt.size(); i < ss.ctx.size(); i++) ta.push(J(ss.ctx[i])); o.set("timings", tm); o.set("stop_type", reason); respond(cs, 200, o.dump()); }
                         else if (stream) { chunk(J::obj(), reason); J u = J::obj(); u.set("id", id); u.set("object", "chat.completion.chunk"); u.set("created", J(created)); u.set("model", alias); u.set("choices", J::arr()); u.set("usage", usage); u.set("timings", tm);

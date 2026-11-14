@@ -101,7 +101,7 @@ struct ExpertCache {
     sycl::queue & q; sycl::queue qup; const CpuExperts & cpu; int nl;
     Cls cls[2]; std::vector<uint8_t> layer_cls; std::vector<int> slot_of; std::vector<uint64_t> tab_h; uint64_t * tab_d = nullptr;
     std::vector<float> score; std::vector<uint32_t> total; std::vector<uint8_t> is_pending;
-    float decay = 0.9954f, margin = 1.25f; int rate = 4, rate_max = 40; double prior_tokens = 60.0; // decay: half-life 150 steps; uploads per step
+    float decay = 0.9954f, margin = 1.25f; int rate = 4, rate_max = 40, rate_div = 3; double prior_tokens = 60.0; // decay: half-life 150 steps; uploads per step
     long hits = 0, misses = 0, uploads = 0; size_t bytes = 0; bool dirty = false;
 
     ExpertCache(sycl::queue & q_, const CpuExperts & c, int n_layers, double budget_gb) : q(q_), qup(q_.get_context(), q_.get_device()), cpu(c), nl(n_layers) {
@@ -166,7 +166,7 @@ struct ExpertCache {
           for (auto & p : up_done) { slot_of[p.key] = p.slot; tab_h[p.key] = (uint64_t) addr(p.cls, p.slot); is_pending[p.key] = 0; dirty = true; uploads++; }
           up_done.clear(); n_pending = up_jobs.size(); }
         for (auto & v : score) v *= decay;
-        const int rate_now = rate > 0 ? std::min(rate_max, std::max(rate, (int) missed.size() / 3)) : 0;
+        const int rate_now = rate > 0 ? std::min(rate_max, std::max(rate, (int) missed.size() / rate_div)) : 0;
         if (rate > 0 && (int) n_pending < 2 * rate_now && !missed.empty()) {
             std::vector<int> cand; cand.reserve(missed.size());
             for (int k : missed) if (slot_of[k] < 0 && !is_pending[k]) cand.push_back(k);
@@ -265,17 +265,17 @@ struct Engine {
     int pf_window = 0; size_t stage_rec = 0;
     float * Xw = nullptr, * HTw = nullptr, * h_embw = nullptr, * h_wtw = nullptr; int * h_idsw = nullptr; uint8_t * stage = nullptr;
     float * pY2, * pWT, * pSHW, * pROPE, * pGU, * pACTE, * cXN, * cY, * cYR, * cAB, * cG, * cQKV, * cO, * cY1, * cRL, * cQS; int8_t * cQQ; int * pID, * pPRM, * pGRP; uint64_t * pTAB;
-    Act pAX, pAS, pAE, cAO; q36g::Tiles pT, pTG; q36g::AttT pAT; int8_t * pQN = nullptr; float * pQSN = nullptr; bool pf_oldatt = false; int * pGX = nullptr, * pCNT = nullptr; float * pYP = nullptr;
+    Act pAX, pAS, pAE, cAO; q36g::Tiles pT, pTG; int * pGX = nullptr, * pCNT = nullptr; float * pYP = nullptr;
     // host USM
     float * h_emb, * h_xn, * h_miss, * h_w; int * h_ids; uint8_t * h_step, * d_step; // step params: int[16] then rope float[NCMAX][64]
     const PEntry * tok_embd = nullptr;
     int n_past = 0, s_pos = 0; size_t vram = 0;
 
     double t_gpu_wait = 0, t_cpu = 0, t_submit = 0, t_head = 0, t_maint = 0; long n_steps = 0;
-    bool prof = false; std::map<std::string, std::pair<double, long>> kprof;
+    bool prof = false; int att_tgt = getenv("Q36_ATT_TGT") ? atoi(getenv("Q36_ATT_TGT")) : 256; std::map<std::string, std::pair<double, long>> kprof;
     static sycl::property_list qprops() { if (getenv("Q36_GPROF")) return { sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{} }; return { sycl::property::queue::in_order{} }; }
     // Q36_GPROF=1 with eager submission (--no-graph): device timestamps of every kernel; busy time vs span of each step
-    bool gprof = getenv("Q36_GPROF") != nullptr; std::vector<std::pair<const char *, sycl::event>> gev; std::map<std::string, std::pair<double, long>> gsum; double g_busy = 0, g_span = 0; long g_steps = 0;
+    bool gprof = getenv("Q36_GPROF") != nullptr; std::vector<std::pair<std::string, sycl::event>> gev; int g_nc = 1; bool g_mtp = false; std::map<std::string, std::pair<double, long>> gsum; double g_busy = 0, g_span = 0; long g_steps = 0;
     void gprof_collect() {
         if (gev.empty()) return; uint64_t t0 = ~0ull, t1 = 0; double busy = 0;
         for (auto & pe : gev) { const uint64_t a = pe.second.get_profiling_info<sycl::info::event_profiling::command_start>(), b = pe.second.get_profiling_info<sycl::info::event_profiling::command_end>();
@@ -285,7 +285,7 @@ struct Engine {
     void gprof_print(long tokens) { for (auto & kv : gsum) printf("  %-14s %7.1f us/call  %6.1f calls/tok  %7.3f ms/tok (device time)\n", kv.first.c_str(), kv.second.first / kv.second.second * 1e6, (double) kv.second.second / tokens, kv.second.first / tokens * 1e3);
         printf("  device busy %.3f ms/tok, span of the steps %.3f ms/tok (gaps %.3f)\n", g_busy / tokens * 1e3, g_span / tokens * 1e3, (g_span - g_busy) / tokens * 1e3); }
     template <class F> sycl::event K(const char * name, F && f) { // submit a kernel; in profiling mode wait for it and book the time
-        if (gprof && !prof) { sycl::event e = f(); gev.push_back({ name, e }); return e; }
+        if (gprof && !prof) { sycl::event e = f(); gev.push_back({ std::string(g_mtp ? "mtp:" : "") + name + "/" + std::to_string(g_nc), e }); return e; }
         if (!prof) return f();
         const double t0 = now_s(); sycl::event e = f(); e.wait(); auto & r = kprof[name]; r.first += now_s() - t0; r.second++; return e;
     }
@@ -317,7 +317,9 @@ struct Engine {
                 l.ab = upload<float>(p.get(s + "ab"));
                 l.S = dalloc<float>((size_t) 32 * 128 * 128); l.YR = dalloc<float>((size_t) RING * 12288); l.G = dalloc<float>(RING * 64);
                 l.QKV = dalloc<float>((size_t) RING * 8192); l.Dr = dalloc<float>((size_t) RING * 4096);
-            } else { l.kv.kq = dalloc<int8_t>((size_t) n_ctx * 512); l.kv.ks = dalloc<float>((size_t) n_ctx * 32); l.kv.vq = dalloc<int8_t>((size_t) n_ctx * 512); l.kv.vs = dalloc<float>((size_t) n_ctx * 16); }
+            } else { const int nt = (n_ctx + 15) / 16 + 1; l.kv.ntile = nt; // tile layout (see q36g::KV), zero-filled: stale slots must stay finite
+                l.kv.kt = dalloc<int8_t>((size_t) 2 * nt * 8 * 512); l.kv.ks = dalloc<float>((size_t) 2 * nt * 8 * 16); l.kv.vt = dalloc<int8_t>((size_t) 2 * nt * 16 * 256); l.kv.vs = dalloc<float>((size_t) 2 * nt * 8 * 16);
+                q.memset(l.kv.kt, 0, (size_t) 2 * nt * 8 * 512); q.memset(l.kv.ks, 0, (size_t) 2 * nt * 8 * 16 * 4); q.memset(l.kv.vt, 0, (size_t) 2 * nt * 16 * 256); q.memset(l.kv.vs, 0, (size_t) 2 * nt * 8 * 16 * 4); q.wait(); }
         }
         head = upload<uint8_t>(p.get("head")); gpar = upload<float>(p.get("g.params")); tok_embd = &p.get("tok_embd");
         X = dalloc<float>(NCMAX * 2048); XN = dalloc<float>(NCMAX * 2048); Y1 = dalloc<float>(NCMAX * 9216); AB = dalloc<float>(NCMAX * 64);
@@ -339,9 +341,6 @@ struct Engine {
             palloc(pY2, W * 2048); palloc(pWT, W * 8); palloc(pSHW, W); palloc(pROPE, W * 64); palloc(pGU, (size_t) PFM * 1024); palloc(pACTE, (size_t) PFM * 8 * 512);
             palloc(pID, W * 8); palloc(pPRM, (W / 8 + W / C + 8) * 16); palloc(pTAB, (size_t) nl * 256);
             pact(pAX, W, 2048); pact(pAS, PFM, 512); pact(pAE, (size_t) PFM * 8, 512); pact(cAO, C, 4096); palloc(pT.q, (size_t) PFM * 4096); pf_pin = halloc<uint8_t>(stage_rec * PFPIN);
-            { const int nt = (n_ctx + 15) / 16 + 1; pAT.ntile = nt; palloc(pAT.kt, (size_t) 2 * nt * 8 * 512); palloc(pAT.ks, (size_t) 2 * nt * 8 * 16);
-              palloc(pAT.vt, (size_t) 2 * nt * 16 * 256); palloc(pAT.vs, (size_t) 2 * nt * 8 * 16);
-              palloc(pQN, (size_t) PFC * 16 * 256); palloc(pQSN, (size_t) PFC * 16 * 8); pf_oldatt = getenv("Q36_OLDATT") != nullptr; }
             { const size_t ngx = (size_t) PFM / 2 + 256; palloc(pTG.q, ngx * 64 * 512); palloc(pTG.d, ngx * 64 * 16); palloc(pTG.s, ngx * 64 * 32);
               palloc(pGX, (ngx + 1) * 32); palloc(pCNT, 512); palloc(pYP, (size_t) PFM * 8 * 2048); } palloc(pT.d, (size_t) PFM * 128);
             palloc(cXN, C * 2048); palloc(cY, C * 2048); palloc(cYR, (C + 3) * 12288); palloc(cAB, C * 64); palloc(cG, C * 64);
@@ -371,12 +370,13 @@ struct Engine {
         for (int b = 0; b < 64; b++) { uint16_t dh; memcpy(&dh, w + 2048 + 2 * b, 2); const float d = h2f(dh); for (int i = 0; i < 32; i++) out[b * 32 + i] = d * (int8_t) w[b * 32 + i]; }
     }
 
-    sycl::event gemv_f32(int nc, const float * W, int rows, const float * x, float * y, int ystride) {
+    sycl::event gemv_f32(int nc, const float * W, int rows, const float * x, float * y, int ystride,
+                         const int * prm = nullptr, const float * dt = nullptr, const float * a = nullptr, float * G = nullptr) {
         switch (nc) {
-            case 1: return q36g::k_gemv_f32n<1>(q, W, rows, 2048, x, y, ystride); case 2: return q36g::k_gemv_f32n<2>(q, W, rows, 2048, x, y, ystride);
-            case 3: return q36g::k_gemv_f32n<3>(q, W, rows, 2048, x, y, ystride); case 4: return q36g::k_gemv_f32n<4>(q, W, rows, 2048, x, y, ystride);
-            case 5: return q36g::k_gemv_f32n<5>(q, W, rows, 2048, x, y, ystride); case 6: return q36g::k_gemv_f32n<6>(q, W, rows, 2048, x, y, ystride);
-            case 7: return q36g::k_gemv_f32n<7>(q, W, rows, 2048, x, y, ystride); default: return q36g::k_gemv_f32n<8>(q, W, rows, 2048, x, y, ystride);
+            case 1: return q36g::k_gemv_f32n<1>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G); case 2: return q36g::k_gemv_f32n<2>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G);
+            case 3: return q36g::k_gemv_f32n<3>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G); case 4: return q36g::k_gemv_f32n<4>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G);
+            case 5: return q36g::k_gemv_f32n<5>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G); case 6: return q36g::k_gemv_f32n<6>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G);
+            case 7: return q36g::k_gemv_f32n<7>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G); default: return q36g::k_gemv_f32n<8>(q, W, rows, 2048, x, y, ystride, prm, dt, a, G);
         }
     }
     template <class... A> sycl::event gemv_q8(int nc, A &&... a) {
@@ -401,8 +401,7 @@ struct Engine {
         else              K("norm_quant", [&] { return q36g::k_norm_quant(q, nc, X, Y2, h_miss, false, l.par + POff::attn_norm, eps, XN, nullptr, a_x); });
         if (l.recr) {
             K("gemv_qkvz", [&] { return gemv_q8(nc, l.w_in, 12288, 2048, a_x, l.YR, prm, 1, RMASK, 12288); });
-            K("ab", [&] { return gemv_f32(nc, l.ab, 64, XN, AB, 64); });
-            K("gdn_gates", [&] { return q36g::k_gdn_gates(q, nc, prm, AB, l.par + POff::dt_bias, l.par + POff::ssm_a, l.G); });
+            K("ab+gates", [&] { return gemv_f32(nc, l.ab, 64, XN, AB, 64, prm, l.par + POff::dt_bias, l.par + POff::ssm_a, l.G); });
             K("gdn_conv", [&] { return q36g::k_gdn_conv(q, nc, prm, l.YR, l.par + POff::conv, eps, l.QKV); });
             K("gdn_core", [&] { return q36g::k_gdn_core(q, nc, prm, l.S, l.QKV, l.G, l.Dr, O); });
             K("gdn_post", [&] { return q36g::k_gdn_post(q, nc, prm, O, l.YR, l.par + POff::ssm_norm, eps, a_o); });
@@ -410,7 +409,7 @@ struct Engine {
             K("gemv_qkv_att", [&] { return gemv_q8(nc, l.w_in, 9216, 2048, a_x, Y1, prm, 0, 0x7fffffff, 9216); });
             sycl::event ep = K("att_prep", [&] { return q36g::k_att_prep(q, nc, prm, Y1, l.par + POff::q_norm, l.par + POff::k_norm, eps, rope, QQ, QS, l.kv); });
             if (kv_only) return ep;
-            K("att", [&] { return q36g::k_att(q, nc, prm, nchb, QQ, QS, l.kv, PART); });
+            K("att", [&] { return q36g::k_att_t(q, nc, prm, nchb, QQ, QS, l.kv, PART); });
             K("att_fin", [&] { return q36g::k_att_fin(q, nc, prm, nchb, PART, Y1, a_o); });
         }
         K("gemv_out", [&] { return gemv_q8(nc, l.w_out, 2048, 4096, a_o, Y, prm, 0, 0x7fffffff, 2048); });
@@ -422,8 +421,7 @@ struct Engine {
     sycl::event sub_B(int il, int nc) {
         const LW & l = L[il]; const uint64_t * tab = cache->tab_d + (size_t) il * 256; const Act a_x = (il == n_layer ? st_m : st_t).a;
         K("sh_gu", [&] { return gemv_q8(nc, l.sh_gu, 1024, 2048, a_x, GU, (const int *) d_step, 0, 0x7fffffff, 1024); });
-        K("exp_glu", [&] { return q36g::k_exp_glu(q, nc, tab, ids_d, a_x, ACT); });
-        K("act_quant", [&] { return q36g::k_act_quant(q, nc, 9, 9, ACT, a_act, GU); });
+        K("exp_glu+quant", [&] { return q36g::k_exp_glu_q(q, nc, tab, ids_d, a_x, GU, a_act); });
         if (cache->layer_cls[il]) return K("down", [&] { return q36g::k_down<true>(q, l.sh_down, nc, tab, ids_d, w_d, shw_d, a_act, Y2); });
         return K("down", [&] { return q36g::k_down<false>(q, l.sh_down, nc, tab, ids_d, w_d, shw_d, a_act, Y2); });
     }
@@ -454,7 +452,7 @@ struct Engine {
 
     // per-step parameters for the kernels: first position, GDN state position, attention chunking, window column, RoPE tables
     void fill_step(uint8_t * dst, int P, int nc, int spos, int woff, int & nchb) const {
-        int cht = 16; while ((P + nc + cht - 1) / cht > 256 && cht < q36g::ATT_CH_MAX) cht *= 2; while ((P + nc + cht - 1) / cht > q36g::ATT_NCH_MAX) cht *= 2; // keys per attention thread
+        int cht = 16; while ((P + nc + cht - 1) / cht > att_tgt && cht < q36g::ATT_CH_MAX) cht *= 2; while ((P + nc + cht - 1) / cht > q36g::ATT_NCH_MAX) cht *= 2; // keys per attention thread
         const int nch = (P + nc + cht - 1) / cht; nchb = 4; while (nchb < nch) nchb *= 2;
         int * hp = (int *) dst; hp[0] = P; hp[1] = spos; hp[2] = nch; hp[3] = cht; hp[4] = 0; hp[5] = woff; float * hr = (float *) (dst + 64);
         const float theta_scale = powf(rope_base, -2.0f / n_rot);
@@ -483,6 +481,23 @@ struct Engine {
             case 7: return q36g::k_head_q6k<7>(q, a...); default: return q36g::k_head_q6k<8>(q, a...);
         }
     }
+    // logits stay on the GPU; only the sampling candidates of each column (logits within W of the maximum) come back
+    int * d_cblk = nullptr, * h_cblk = nullptr; float cand_W = 16.0f; long cand_sum = 0, cand_n = 0;
+    void head_cands(int nc, Act a, bool draft_vocab, float W) {
+        double t0 = now_s();
+        if (!d_cblk) { d_cblk = dalloc<int>((size_t) NCMAX * q36g::CAND_BLK); h_cblk = halloc<int>((size_t) NCMAX * q36g::CAND_BLK); }
+        int n = n_vocab;
+        if (draft_vocab && draft_rows_d) { n = n_draft_rows; K("head_draft", [&] { return head_k(nc, head, n_draft_rows, a, LOG, n_vocab, draft_rows_d); }); }
+        else K("head_q6k", [&] { return head_k(nc, head, n_vocab, a, LOG, n_vocab, nullptr); });
+        K("cand", [&] { return q36g::k_cand(q, LOG, n, n_vocab, nc, W, d_cblk); });
+        // counts first, then only the candidates found
+        { std::vector<sycl::event> ev; q.wait(); for (int c = 0; c < nc; c++) { const int * b = d_cblk + (size_t) c * q36g::CAND_BLK; ev.push_back(q.memcpy(h_cblk + (size_t) c * q36g::CAND_BLK, b, sizeof(int) * 2)); } sycl::event::wait(ev); }
+        { std::vector<sycl::event> ev; for (int c = 0; c < nc; c++) { const int cnt = std::min(h_cblk[(size_t) c * q36g::CAND_BLK], q36g::CAND_CAP); cand_sum += h_cblk[(size_t) c * q36g::CAND_BLK]; cand_n++;
+              if (cnt > 0) ev.push_back(q.memcpy(h_cblk + (size_t) c * q36g::CAND_BLK + 2, d_cblk + (size_t) c * q36g::CAND_BLK + 2, sizeof(int) * 2 * (size_t) cnt)); } sycl::event::wait(ev); }
+        t_head += now_s() - t0;
+    }
+    // the full logits of column c of the last head_cands call (fallback of the sampler)
+    void fetch_logits(int c, float * dst, int n) { q.memcpy(dst, LOG + (size_t) c * n_vocab, sizeof(float) * (size_t) n).wait(); }
     void head_logits(int nc, Act a, float * logits_host, bool draft_vocab) {
         double t0 = now_s();
         if (draft_vocab && draft_rows_d) {
@@ -508,12 +523,13 @@ struct Engine {
     // caches roll back by themselves: speculative positions are simply overwritten).
     int step_P = 0;
     void step(int nc, bool want_logits, float * logits_host) {
+        g_nc = nc; g_mtp = false;
         const int P = n_past; if (P + nc > n_ctx) throw std::runtime_error("context full");
         double ts = now_s(); int nchb; set_step(P, nc, nchb);
         for (int il = 0; il < n_layer; il++) run_layer(il, nc, nchb, ts);
         K("norm_quant", [&] { return q36g::k_norm_quant(q, nc, X, Y2, h_miss, false, gpar, eps, HT, nullptr, a_x); });
         t_submit += now_s() - ts;
-        if (want_logits) head_logits(nc, a_x, logits_host, false); else q.wait();
+        if (want_logits) { if (logits_host) head_logits(nc, a_x, logits_host, false); else head_cands(nc, a_x, false, cand_W); } else q.wait();
         step_P = P; n_steps++; if (gprof) { q.wait(); gprof_collect(); }
         { const double tm = now_s(); cache->maintain(missed); missed.clear(); t_maint += now_s() - tm; }
     }
@@ -522,7 +538,8 @@ struct Engine {
     // MTP block over nc tokens at positions P..P+nc-1: token embeddings in h_embm, the hidden states that predicted them in HIN.
     // kv_only: just append K/V of the MTP attention (catch-up with the true hidden states). Otherwise the output hidden
     // states go to HM[c] and, if asked, logits of column nc-1... of all columns.
-    void mtp_step(int nc, int P, bool kv_only, float * logits_host) {
+    void mtp_step(int nc, int P, bool kv_only, float * logits_host, int * best_out = nullptr) {
+        g_nc = nc; g_mtp = true;
         const int il = n_layer; double ts = now_s(); int nchb; set_step(P, nc, nchb);
         if (kv_only) {
             LGraph & g = graphs[il]; const bool gr = use_graph && !prof;
@@ -533,7 +550,11 @@ struct Engine {
         run_layer(il, nc, nchb, ts);
         K("norm_quant", [&] { return q36g::k_norm_quant(q, nc, Xm, Y2, h_miss, false, L[il].par + POff::head_norm, eps, HM, nullptr, a_xm); });
         t_submit += now_s() - ts;
-        if (logits_host) head_logits(nc, a_xm, logits_host, true); else q.wait();
+        if (best_out) { // greedy draft token: the GPU keeps only the maximal logits, the lowest index wins
+            head_cands(1, a_xm, true, 0.0f); const int * b = h_cblk; int best = INT32_MAX; const int cnt = std::min(b[0], q36g::CAND_CAP);
+            for (int k = 0; k < cnt; k++) best = std::min(best, b[2 + 2 * k]);
+            *best_out = best == INT32_MAX ? 0 : (draft_rows_d ? draft_rows_h[best] : best);
+        } else if (logits_host) head_logits(nc, a_xm, logits_host, true); else q.wait();
         { const double tm = now_s(); cache->maintain(missed); missed.clear(); t_maint += now_s() - tm; }
     }
 
@@ -637,17 +658,7 @@ struct Engine {
                 } else {
                     p_mm_q8<0>(q, l.w_in, 9216, 2048, pT, n, cY1, 9216); PKW("mm qkv");
                     k_att_prep(q, n, pPRM + chunk_prm[ci] * 16, cY1, l.par + POff::q_norm, l.par + POff::k_norm, eps, pROPE + (size_t) c0 * 64, cQQ, cQS, l.kv); PKW("att prep");
-                    if (!pf_oldatt) {
-                        if (ci == 0 && P0 > 0) p_kv_tiles(q, l.kv, 0, (P0 + 15) / 16, P0, pAT); // keys before the window
-                        const int k0 = P0 + c0, k1 = P0 + c0 + n;
-                        p_kv_tiles(q, l.kv, k0 / 16, (k1 + 15) / 16, k1, pAT); p_q_nat(q, n, cQQ, cQS, pQN, pQSN); PKW("att tiles");
-                        p_flash(q, n, k0, pQN, pQSN, pAT, cY1, cAO); PKW("attention");
-                    } else
-                    for (int ai = chunk_att[ci]; ai < chunk_att[ci + 1]; ai++) {
-                        const Att & a = att[ai]; const size_t off = (size_t) (a.c0 - c0);
-                        k_att(q, a.nc, pPRM + a.prm * 16, a.nch, cQQ + off * 4096, cQS + off * 256, l.kv, PART);
-                        k_att_fin(q, a.nc, pPRM + a.prm * 16, a.nch, PART, cY1 + off * 9216, act_at(cAO, off, 4096));
-                    }
+                    p_flash(q, n, P0 + c0, cQQ, cQS, l.kv, cY1, cAO);
                     PKW("attention");
                 }
                 p_act_tiles(q, n, 4096, cAO, pT); p_mm_q8<0>(q, l.w_out, 2048, 4096, pT, n, cY, 2048); PKW("mm out");
